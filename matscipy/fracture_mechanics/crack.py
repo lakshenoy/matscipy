@@ -41,7 +41,8 @@ from ase.optimize.precon import Exp
 from matscipy.atomic_strain import atomic_strain
 from matscipy.elasticity import (rotate_elastic_constants,
                                  rotate_cubic_elastic_constants,
-                                 Voigt_6_to_full_3x3_stress)
+                                 Voigt_6_to_full_3x3_stress,
+                                 Voigt_6x6_to_full_3x3x3x3)
 from matscipy.surface import MillerDirection, MillerPlane
 from matscipy.neighbours import neighbour_list
 from matscipy.fracture_mechanics.solvers import ode12r
@@ -724,7 +725,222 @@ class CubicCrystalCrack:
         dy = ref_y - y0
         sig_x, sig_y, sig_xy = self.stresses_from_cartesian_coordinates(dx, dy, k)
         return sig_x, sig_y, sig_xy
+ 
+# Calculate dislocation displacement field and its gradient
+# for a dislocation in a crack system.
 
+class AnisotropicDislocation:
+    """
+    Displacement and displacement gradient field of straight 
+    dislocation in anisotropic elastic media.
+    See: 
+    cf. pp. 467 in J.P. Hirth and J. Lothe, Theory of Dislocations, 2nd ed.
+    """
+
+    def __init__(self, a0, crack_surface, crack_front, n, xi, Burgers, C11=None, 
+                 C12=None, C44=None, C=None):
+        """
+        Initialize a dislocation in the crack system with elastic constants C11, C12
+        and C44 (optionally 6x6 elastic matrix unrotated).
+        The dislocation is defined by m (in-plane direction perpendicular
+        to the dislocation line),n (the slip plane normal), and xi 
+        (dislocation line direction).
+        """
+
+        # x (third_dir) - direction in which the crack is running
+        # y (crack_surface) - free surface that forms due to the crack
+        # z (crack_front) - direction of the crack front
+
+        # normalize axis of crack coordinates 
+        third_dir = np.cross(crack_surface, crack_front)
+        third_dir = np.array(third_dir) / np.sqrt(np.dot(third_dir,
+                                                         third_dir))
+        crack_surface = np.array(crack_surface) / \
+            np.sqrt(np.dot(crack_surface, crack_surface))
+        crack_front = np.array(crack_front) / \
+            np.sqrt(np.dot(crack_front, crack_front))
+        
+        # define rotation matrix from crack system to dislocation system
+        # since m,n,xi are not always aligned with x,y and z
+        A = np.array([third_dir, crack_surface, crack_front])
+        if np.linalg.det(A) < 0:
+            third_dir = -third_dir
+        A = np.array([third_dir, crack_surface, crack_front])
+
+        # 
+        if C is not None:
+            C6 = rotate_elastic_constants(C, A)
+        else:
+            C6 = rotate_cubic_elastic_constants(C11, C12, C44, A)
+        # convert Voigt to tensor
+        C3333 = Voigt_6x6_to_full_3x3x3x3(C6)
+        # rotate elastic matrix
+        cijkl = np.einsum('ig,jh,ghmn,km,ln', \
+            A, A, C3333, A, A)
+        # get m 
+        m = np.cross(n, xi)
+
+        # normalize m, n and xi
+        m = np.array(m) / np.sqrt(np.dot(m, m))
+        n = np.array(n) / np.sqrt(np.dot(n, n))
+        xi = np.array(xi) / np.sqrt(np.dot(xi, xi))
+        disloc_sys = np.array([m, n, xi])
+        if np.linalg.det(disloc_sys) < 0:
+            m = -m        
+        
+        # Rotate vectors from dislocation system to crack coordinates
+        m = np.einsum('ij,j', A, m)
+        n = np.einsum('ij,j', A, n)
+        xi = np.einsum('ij,j', A, xi)
+        b = np.einsum('ij,j', A, Burgers)
+
+        self.m = m
+        self.n = n
+        self.xi = xi
+        self.b = b
+            
+        # solve the Stroh sextic formalism: the same as Stroh.py from atomman
+        # this part can also be replaced by calling Stroh.py from atomman
+        mm = np.einsum('i,ijkl,l', m, cijkl, m, dtype=float, casting='safe')
+        mn = np.einsum('i,ijkl,l', m, cijkl, n, dtype=float, casting='safe')
+        nm = np.einsum('i,ijkl,l', n, cijkl, m, dtype=float, casting='safe')
+        nn = np.einsum('i,ijkl,l', n, cijkl, n, dtype=float, casting='safe')
+
+        nninv = np.linalg.inv(nn)
+        mn_nninv = np.dot(mn, nninv)
+        
+        N = np.zeros((6,6), dtype=float)
+        N[0:3,0:3] = -np.dot(nninv, nm)
+        N[0:3,3:6] = -nninv
+        N[3:6,0:3] = -(np.dot(mn_nninv, nm) - mm)
+        N[3:6,3:6] = -mn_nninv
+
+        # solve the eigenvalue problem
+        Np, Nv = np.linalg.eig(N)
+
+        # The eigenvector Nv contains the vectors A and L.
+        # Normalize A and L, such that 2*A*L=1 
+        for i in range(0,6):
+            norm = 2.0 * np.dot(Nv[0:3, i], Nv[3:6, i])
+            Nv[0:3, i] /= np.sqrt(norm)
+            Nv[3:6, i] /= np.sqrt(norm)
+
+        self.Np = Np
+        self.Nv = Nv
+
+    def displacements(self, r, theta):
+        """
+        Displacement field of the dislocation. 
+        Positions are passed in cylinder coordinates.
+        Currently only for 2D, can be extended.
+
+        Parameters
+        ----------
+        r : array_like
+            Distances from the dislocation center.
+        theta : array_like
+            Angles with respect to the plane of the crack.
+
+        Returns
+        -------
+        u : array
+            Displacements parallel to the plane of the crack.
+        v : array
+            Displacements normal to the plane of the crack.
+        """
+        
+        # Cylinder coordinates to Cartesian  
+        x = r * np.cos(theta)
+        y = r * np.sin(theta) 
+        coordinates = np.zeros((np.size(x),3), dtype=float)
+        coordinates[:,0] = x
+        coordinates[:,1] = y
+        
+        # calculation
+        signs = np.sign(np.imag(self.Np))
+        signs[np.where(signs==0.0)] = 1.0
+        A = self.Nv[0:3,:]
+        L = self.Nv[3:6,:]
+        D = np.einsum('i,ij', self.b, L)
+        constant_factor = signs * A * D
+
+        eta = (np.expand_dims(np.einsum('i,ji', self.m, coordinates), axis=1)
+            + np.outer(np.einsum('i,ji', self.n, coordinates), self.Np))
+
+        # get the displacements
+        disp = ((1.0/(2.0 * np.pi * 1.0j))
+            * np.einsum('ij,kj', np.log(eta), constant_factor))
+        
+        u = np.real(disp)[:,0]
+        v = np.real(disp)[:,1]
+
+        return u, v
+
+    def displacement_gradient(self, r, theta):
+        """
+        Displacement gradient tensor of the dislocation. 
+        Positions are passed in cylinder coordinates.
+
+        Parameters
+        ----------
+        r : array_like
+            Distances from the dislocation center.
+        theta : array_like
+            Angles with respect to the plane of the crack.
+
+        Returns
+        -------
+        du_dx : array
+            Derivatives of displacements parallel to the plane within the plane.
+        du_dy : array
+            Derivatives of displacements parallel to the plane perpendicular to
+            the plane.
+        dv_dx : array
+            Derivatives of displacements normal to the plane of the crack within
+            the plane.
+        dv_dy : array
+            Derivatives of displacements normal to the plane of the crack
+            perpendicular to the plane.
+        """
+        # Cylinder coordinates to Cartesian 
+        # Currently only for 2D, can be extended 
+        x = r * np.cos(theta) 
+        y = r * np.sin(theta)
+        coordinates = np.zeros((np.size(x),3), dtype=float)
+        coordinates[:,0] = x
+        coordinates[:,1] = y
+
+        signs = np.sign(np.imag(self.Np))
+        signs[np.where(signs==0.0)] = 1.0
+        
+        A = self.Nv[0:3,:]
+        A1 = self.Nv[0,:]
+        A2 = self.Nv[1,:]
+        A3 = self.Nv[2,:]
+        L = self.Nv[3:6,:]
+        D = signs * np.einsum('i,ij', self.b, L)
+
+        eta = (np.expand_dims(np.einsum('i,ji', self.m, coordinates), axis=1)
+            + np.outer(np.einsum('i,ji', self.n, coordinates), self.Np))
+
+        # get the displacement gradient
+        pref = (1.0/(2.0 * np.pi * 1.0j))
+        du_dx = np.real((pref * np.einsum('ij,j', 1/eta, (self.m[0]+self.Np*self.n[0])*A1*D)))
+        du_dy = np.real((pref * np.einsum('ij,j', 1/eta, (self.m[1]+self.Np*self.n[1])*A1*D)))   
+        du_dz = np.real((pref * np.einsum('ij,j', 1/eta, (self.m[2]+self.Np*self.n[2])*A1*D)))
+        dv_dx = np.real((pref * np.einsum('ij,j', 1/eta, (self.m[0]+self.Np*self.n[0])*A2*D)))
+        dv_dy = np.real((pref * np.einsum('ij,j', 1/eta, (self.m[1]+self.Np*self.n[1])*A2*D)))   
+        dv_dz = np.real((pref * np.einsum('ij,j', 1/eta, (self.m[2]+self.Np*self.n[2])*A2*D)))
+        dw_dx = np.real((pref * np.einsum('ij,j', 1/eta, (self.m[0]+self.Np*self.n[0])*A3*D)))
+        dw_dy = np.real((pref * np.einsum('ij,j', 1/eta, (self.m[1]+self.Np*self.n[1])*A3*D)))    
+        dw_dz = np.real((pref * np.einsum('ij,j', 1/eta, (self.m[2]+self.Np*self.n[2])*A3*D)))
+        
+        # add unity matrix to turn this into the deformation gradient tensor.
+        du_dx += np.ones_like(du_dx)
+        dv_dy += np.ones_like(dv_dy)
+        dw_dz += np.ones_like(dw_dz)
+
+        return np.transpose([[du_dx, du_dy], [dv_dx, dv_dy]])
 
 class SinclairCrack:
     """
