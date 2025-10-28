@@ -80,43 +80,6 @@ class NcflexAnalysis:
         self.fbar0 = a0.get_forces()[self.regFF]
     
 
-    def prep_x_spline(self, thinning_step = 2, plot_Ks=False):
-        
-        x_spline = self.x.copy()
-
-        # Filter out repeated alphas
-        iclose = np.where(np.isclose(np.diff(x_spline[:,-2]),0))[0]
-        if len(iclose)>0:
-            iter = 0
-            print(f'iter {iter}: ', iclose)
-            while len(iclose)>0 and iter<10:
-                idel = iclose[::2] # every other index
-                x_spline = np.delete(x_spline, idel, axis=0)
-                iclose = np.where(np.isclose(np.diff(x_spline[:,-2]),0))[0]
-                print(f'iter {iter}: ', iclose)
-                iter += 1
-            if iter==10:
-                print('Warning: spline fit failed due to too many repeated alphas')
-
-        # Thin the data to remove backtracking noise or oscillations
-        # To disable, set thinning_step = 1 
-        x_spline = x_spline[::thinning_step]
-
-        # Store the processed trajectory data, to be used for spline fitting
-        self.x_spline = x_spline
-
-        # Plot alphas vs K
-        if plot_Ks:
-            alphas = x_spline[:,-2]
-            Ks = x_spline[:,-1] #/ self.k1g
-            plt.scatter(alphas, Ks, s=2) ; plt.title(self.crksys) 
-            plt.xlabel(r'$\alpha$ crack tip position '+r'($\mathrm{\AA}$)')
-            #plt.ylabel(r'$K/K_{\mathrm{g}}$ relative stress intensity factor')
-            plt.ylabel(r'$K$ stress intensity factor')
-            plt.tight_layout() ; plt.grid() 
-            plt.savefig('spline_data.png') ; plt.clf()
-
-
     def find_turning_points(self, alphas=None, Ks=None, alpha_period=None, Kratio=0.05):
         
         tp_alphas, Kmins, Kmaxs = [], [], []
@@ -143,6 +106,8 @@ class NcflexAnalysis:
         i_alpha_groups = np.split(i_minK, np.where(np.diff(sub_alphas)>half_period)[0]+1)
         for igroup in i_alpha_groups:
             imin = igroup[np.argmin(Ks[igroup])]
+            if imin==0 or imin==len(alphas)-1:
+                continue
             tp_alphas += [ alphas[imin] ]
             Kmins += [ Ks[imin] ]
 
@@ -153,6 +118,8 @@ class NcflexAnalysis:
         i_alpha_groups = np.split(i_maxK, np.where(np.diff(sub_alphas)>half_period)[0]+1)
         for igroup in i_alpha_groups:
             imax = igroup[np.argmax(Ks[igroup])]
+            if imax==0 or imax==len(alphas)-1:
+                continue
             tp_alphas += [ alphas[imax] ]
             Kmaxs += [ Ks[imax] ]
 
@@ -161,6 +128,66 @@ class NcflexAnalysis:
         # print('Kmins: ', Kmins)
         # print('Kmaxs: ', Kmaxs)
         return tp_alphas, Kmins, Kmaxs
+    
+
+    def prep_x_spline(self,  alpha_tol=0.001, K_tol=0.001, thinning_step = 2, plot_Ks=False):
+        
+        x_spline = self.x.copy()
+
+        # Filter out close alphas
+        iclose = np.where(np.abs(np.diff(x_spline[:,-2])) < alpha_tol)[0]
+        if len(iclose)>0:
+            iter = 0
+            print('Removing data points with close alphas:')
+            print(f'iter {iter}: ', iclose)
+            while len(iclose)>0 and iter<10:
+                idel = iclose[::2] # every other index
+                x_spline = np.delete(x_spline, idel, axis=0)
+                iclose = np.where(np.abs(np.diff(x_spline[:,-2])) < alpha_tol)[0]
+                print(f'iter {iter}: ', iclose)
+                iter += 1
+            if iter==10:
+                print('Warning: spline fit failed due to too many repeated alphas')
+        
+        # Filter out close Ks, and adjacent Ks with the wrong sign
+        tp_alphas, _, _ = self.find_turning_points(alphas=x_spline[:,-2], Ks=x_spline[:,-1])
+        idel = []
+        alphas = x_spline[:,-2]
+        Ks = x_spline[:,-1]
+        for i in range(len(tp_alphas)-1):
+            alpha1 = tp_alphas[i]
+            alpha2 = tp_alphas[i+1]
+            idx_ran = np.intersect1d( np.where(alphas>=alpha1)[0], np.where(alphas<=alpha2)[0] )
+
+            diff = np.diff(Ks[idx_ran])
+            iclose = np.where( np.abs(diff) < K_tol )[0]
+
+            diff_sign = np.sign( diff )
+            direc = np.sign(sum(diff_sign))
+            idirec = np.where( np.sign(diff) != direc )[0]
+            
+            idel_sub = np.unique( np.concatenate( (iclose, idirec) ) )
+            idel += list( idx_ran[idel_sub] )
+        print('Removing data points with close Ks, or wrong sign of consec Ks: ', idel)
+        x_spline = np.delete(x_spline, idel, axis=0)
+
+        # Thin the data to remove backtracking noise or oscillations
+        # To disable, set thinning_step = 1 
+        x_spline = x_spline[::thinning_step]
+
+        # Store the processed trajectory data, to be used for spline fitting
+        self.x_spline = x_spline
+
+        # Plot alphas vs K
+        if plot_Ks:
+            alphas = x_spline[:,-2]
+            Ks = x_spline[:,-1] #/ self.k1g
+            plt.scatter(alphas, Ks, s=2) ; plt.title(self.crksys) 
+            plt.xlabel(r'$\alpha$ crack tip position '+r'($\mathrm{\AA}$)')
+            #plt.ylabel(r'$K/K_{\mathrm{g}}$ relative stress intensity factor')
+            plt.ylabel(r'$K$ stress intensity factor')
+            plt.tight_layout() ; plt.grid() 
+            plt.savefig('spline_data.png') ; plt.clf()
       
 
     def fit_spline(self, degree=3, smoothness=0.0, only_Ks=False):
@@ -216,10 +243,8 @@ class NcflexAnalysis:
         stable = np.zeros(len(alpha_ranges),dtype=bool) # initialize all as unstable (ie False)
 
         cs = self.splines['K']
-        alphas_cs = np.linspace(alphas[0],alphas[10],50)
-        Ks_cs = cs(alphas_cs) 
-        Ks_cs_diff = np.diff(Ks_cs)
-        if Ks_cs_diff[0]>0:
+        Kdiff_branch0 = cs(tp_alphas[0]) - cs(alphas[0])
+        if Kdiff_branch0>0:
             stable[::2] = True # First alpha range is stable
         else:
             stable[1::2] = True # First alpha range is unstable
@@ -286,7 +311,7 @@ class NcflexAnalysis:
         iunstable = np.where(stable==False)[0]
         for i in iunstable:
             sub_alphas, sub_Ks = get_subset(alphas_cs,Ks_cs,alpha_ranges[i])
-            plt.plot(sub_Ks,sub_alphas,color='black',linestyle='dashed')
+            plt.plot(sub_Ks,sub_alphas,color='black')#,linestyle='dashed')
             #plt.plot(sub_alphas,sub_Ks,color='black',linestyle='dashed')
 
         # Plot original data points
